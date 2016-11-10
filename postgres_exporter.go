@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v2"
@@ -19,6 +20,31 @@ import (
 )
 
 var Version string = "0.0.1"
+
+type KeyValue struct {
+	key   string
+	value string
+}
+
+type KeyValues []KeyValue
+
+func (i *KeyValues) String() string {
+	return fmt.Sprintf("%s", *i)
+}
+
+func (i *KeyValues) Set(value string) error {
+	splits := strings.Split(value, "=")
+	if len(splits) != 2 {
+		return fmt.Errorf("Invalid argument: %s, expected k=v", value)
+	}
+	k := splits[0]
+	v := splits[1]
+	kv := KeyValue{key: k, value: v}
+	*i = append(*i, kv)
+	return nil
+}
+
+var keyValues KeyValues
 
 var (
 	listenAddress = flag.String(
@@ -38,6 +64,14 @@ var (
 		"Do not run, simply dump the maps.",
 	)
 )
+
+func init() {
+	flag.Var(
+		&keyValues,
+		"extend.key-value",
+		"Variable list of key=value which will be passed on to every metric",
+	)
+}
 
 // Metric name parts.
 const (
@@ -83,6 +117,7 @@ type ColumnMapping struct {
 type MetricMapNamespace struct {
 	labels         []string             // Label names for this namespace
 	columnMappings map[string]MetricMap // Column mappings in this namespace
+	keyValues      KeyValues            // Extra key-values to be passed into the metrics
 }
 
 // Stores the prometheus metric description which a given column will be mapped
@@ -311,7 +346,7 @@ func addQueries(queriesPath string) (err error) {
 }
 
 // Turn the MetricMap column mapping into a prometheus descriptor mapping.
-func makeDescMap(metricMaps map[string]map[string]ColumnMapping) map[string]MetricMapNamespace {
+func makeDescMap(metricMaps map[string]map[string]ColumnMapping, keyValues KeyValues) map[string]MetricMapNamespace {
 	var metricMap = make(map[string]MetricMapNamespace)
 
 	for namespace, mappings := range metricMaps {
@@ -324,7 +359,16 @@ func makeDescMap(metricMaps map[string]map[string]ColumnMapping) map[string]Metr
 				constLabels = append(constLabels, columnName)
 			}
 		}
-
+		// Append keyValues as needed
+		for _, kv := range keyValues {
+			constLabels = append(constLabels, kv.key)
+			thisMap[kv.key] = MetricMap{
+				discard: true,
+				conversion: func(in interface{}) (float64, bool) {
+					return math.NaN(), true
+				},
+			}
+		}
 		for columnName, columnMapping := range mappings {
 			switch columnMapping.usage {
 			case DISCARD, LABEL:
@@ -398,7 +442,7 @@ func makeDescMap(metricMaps map[string]map[string]ColumnMapping) map[string]Metr
 			}
 		}
 
-		metricMap[namespace] = MetricMapNamespace{constLabels, thisMap}
+		metricMap[namespace] = MetricMapNamespace{constLabels, thisMap, keyValues}
 	}
 
 	return metricMap
@@ -516,8 +560,8 @@ func NewExporter(dsn string) *Exporter {
 			Name:      "last_scrape_error",
 			Help:      "Whether the last scrape of metrics from PostgreSQL resulted in an error (1 for error, 0 for success).",
 		}),
-		variableMap: makeDescMap(variableMaps),
-		metricMap:   makeDescMap(metricMaps),
+		variableMap: makeDescMap(variableMaps, keyValues),
+		metricMap:   makeDescMap(metricMaps, keyValues),
 	}
 }
 
@@ -606,7 +650,13 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 				continue
 			}
 
-			ch <- prometheus.MustNewConstMetric(columnMapping.desc, columnMapping.vtype, fval)
+			// Get the label values for this row
+			var labels = make([]string, len(mapping.keyValues))
+			for idx, kv := range mapping.keyValues {
+				labels[idx] = kv.value
+			}
+
+			ch <- prometheus.MustNewConstMetric(columnMapping.desc, columnMapping.vtype, fval, labels...)
 		}
 	}
 
@@ -657,9 +707,13 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 				// Get the label values for this row
 				var labels = make([]string, len(mapping.labels))
-				for idx, columnName := range mapping.labels {
-
+				for idx := 0; idx < len(mapping.labels)-len(mapping.keyValues); idx++ {
+					columnName := mapping.labels[idx]
 					labels[idx], _ = dbToString(columnData[columnIdx[columnName]])
+				}
+				idxOffset := len(mapping.labels) - len(mapping.keyValues)
+				for idx, kv := range mapping.keyValues {
+					labels[idxOffset+idx] = kv.value
 				}
 
 				// Loop over column names, and match to scan data. Unknown columns
@@ -678,7 +732,6 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 							log.Errorln("Unexpected error parsing column: ", namespace, columnName, columnData[idx])
 							continue
 						}
-
 						// Generate the metric
 						ch <- prometheus.MustNewConstMetric(metricMapping.desc, metricMapping.vtype, value, labels...)
 					} else {
